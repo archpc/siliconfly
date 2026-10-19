@@ -265,6 +265,80 @@ private func runTrial(_ d: [String: Any], _ id: Any?) {
             "gf_counts": gfCounts, "loom_counts": loomCounts])
 }
 
+/// Stimulus trial primitive for explicitly targeted neurons (Operation Banana
+/// Peel): settle, then apply `stimulate()` current drive to the requested
+/// indices for `duration_ms`, then `post_ms` of silence. Records per-step
+/// GF/LC/pop counts AND per-step spike membership of the watched neurons
+/// (e.g. the MN9 readout). Uses the existing extInput drive path — no kernel
+/// changes; stimulus is deterministic per-step drive, the same drive class the
+/// loom port uses (NOT Shiu's 200 Hz Poisson draw; documented in the report).
+private func runStimTrial(_ d: [String: Any], _ id: Any?) {
+    guard let s = sim else { fail(id, "no_sim", "call reset first"); return }
+    let settle = max(0, min(MAX_TRIAL_MS, Int((d["settle_ms"] as? NSNumber)?.intValue ?? 2000)))
+    let duration = Int((d["duration_ms"] as? NSNumber)?.intValue ?? 400)
+    guard duration >= 1, duration <= MAX_TRIAL_MS else {
+        fail(id, "bad_duration", "duration_ms must be 1...\(MAX_TRIAL_MS)"); return
+    }
+    let post = max(0, min(MAX_TRIAL_MS, Int((d["post_ms"] as? NSNumber)?.intValue ?? 200)))
+    let strength = clampF(num(d, "strength") ?? 0, 0, 2)
+    guard let ns = d["neurons"] as? [NSNumber], !ns.isEmpty, ns.count <= 512 else {
+        fail(id, "bad_target", "neurons required (1..512)"); return
+    }
+    let targets = ns.map { $0.intValue }
+    guard targets.allSatisfy({ $0 >= 0 && $0 < s.n }) else {
+        fail(id, "bad_neuron_id", "ids must be 0..<\(s.n)"); return
+    }
+    var watch = (d["watch"] as? [NSNumber])?.map { $0.intValue } ?? []
+    guard watch.count <= 256, watch.allSatisfy({ $0 >= 0 && $0 < s.n }) else {
+        fail(id, "bad_watch", "watch ids must be valid, at most 256"); return
+    }
+
+    // settle with zeroed sensory input
+    s.loomL = 0; s.loomR = 0; s.airPuff = 0
+    _ = s.consumeGF()
+    if settle > 0 { s.step(settle) }
+    _ = s.consumeGF()
+    let preRates = ratesDict(s)
+    let preSimMs = s.simMs
+
+    var gfCounts = [Int](), loomCounts = [Int](), popCounts = [Int]()
+    var watchPerStep = [Int]()
+    var firstWatchMs = [Int](repeating: -1, count: watch.count)
+    var watchTotals = [Int](repeating: 0, count: watch.count)
+    var spikesBefore = s.totalSpikes
+    var gfTotal = 0
+    s.stimulate(targets, strength: strength, durationMs: duration)
+    for _ in 0..<(duration + post) {
+        s.step(1)
+        let hist = s.lastStepGroupCounts()
+        let totalNow = s.totalSpikes
+        popCounts.append(totalNow - spikesBefore)
+        spikesBefore = totalNow
+        let gf = Int(hist[2])
+        gfCounts.append(gf)
+        gfTotal += gf
+        loomCounts.append(Int(hist[1]))
+        let spikeList = s.lastStepSpikes()
+        var wThis = 0
+        for (wi, wn) in watch.enumerated() where spikeList.contains(Int32(wn)) {
+            wThis += 1
+            watchTotals[wi] += 1
+            if firstWatchMs[wi] < 0 { firstWatchMs[wi] = ms }
+        }
+        watchPerStep.append(wThis)
+    }
+    let postRates = ratesDict(s)
+    ok(id, ["seed": simSeed, "shuffled": shuffled, "shuffle_seed": shuffleSeed,
+            "settle_ms": settle, "duration_ms": duration, "post_ms": post,
+            "strength": strength, "targeted": targets.count,
+            "pre_sim_ms": preSimMs, "sim_ms": s.simMs,
+            "pre_rates": preRates, "post_rates": postRates,
+            "gf_total": gfTotal,
+            "gf_counts": gfCounts, "loom_counts": loomCounts, "pop_counts": popCounts,
+            "watch_ids": watch, "watch_totals": watchTotals,
+            "watch_first_ms": firstWatchMs, "watch_per_step": watchPerStep])
+}
+
 private func handle(_ line: String) {
     guard let data = line.data(using: .utf8),
           let obj = try? JSONSerialization.jsonObject(with: data),
@@ -394,6 +468,9 @@ private func handle(_ line: String) {
 
     case "trial":
         runTrial(d, id)
+
+    case "stim_trial":
+        runStimTrial(d, id)
 
     case "read":
         guard let s = sim else { fail(id, "no_sim", "call reset first"); return }
