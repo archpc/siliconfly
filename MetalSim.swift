@@ -697,4 +697,12 @@ final class MetalSim {
         let ptr = baselineBuf.contents().bindMemory(to: Float.self, capacity: n)
         values.withUnsafeBufferPointer { ptr.update(from: $0.baseAddress!, count: n) }
     }
+
+    /// Current per-neuron resting drive, straight from the baseline buffer
+    /// (lab-server ablation hook: read-modify-zero without duplicating the
+    /// seeded draw logic).
+    func baselineValues() -> [Float] {
+        let ptr = baselineBuf.contents().bindMemory(to: Float.self, capacity: n)
+        return [Float](UnsafeBufferPointer(start: ptr, count: n))
+    }
 }

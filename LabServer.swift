@@ -113,12 +113,75 @@ private var sim: MetalSim? = nil
 private var simSeed: UInt32 = 0
 private var shuffled = false
 private var shuffleSeed: UInt32 = 0
-private var connectome: Connectome? = nil
+private var connectome: Connectome? = nil       // pristine (with shuffle if --shuffle)
+private var activeConnectome: Connectome? = nil // pristine or ablated; reset uses this
+private var ablationDesc: String? = nil
+private var ablatedTargets: Set<Int> = []
+
+// Group membership derived from the connectome arrays (NOT from the live sim's
+// groups, which may already be ablated). loomL/R use the `side` table.
+private func groupIndices(in c: Connectome, named g: String) -> [Int]? {
+    var result: [Int] = []
+    for i in 0..<c.n {
+        let left = c.side[i] == 1
+        switch g {
+        case "gf":     if c.role[i] == Role.gf { result.append(i) }
+        case "dnaL":   if (c.role[i] == Role.dna01 || c.role[i] == Role.dna02) && left { result.append(i) }
+        case "dnaR":   if (c.role[i] == Role.dna01 || c.role[i] == Role.dna02) && !left { result.append(i) }
+        case "mdn":    if c.role[i] == Role.mdn { result.append(i) }
+        case "fwd":    if c.role[i] == Role.dnp09 { result.append(i) }
+        case "groom":  if c.role[i] == Role.dng11 { result.append(i) }
+        case "escw":   if c.role[i] == Role.escw { result.append(i) }
+        case "loomL":  if (c.role[i] == Role.lc4 || c.role[i] == Role.lplc2) && left { result.append(i) }
+        case "loomR":  if (c.role[i] == Role.lc4 || c.role[i] == Role.lplc2) && !left { result.append(i) }
+        case "loom":   if c.role[i] == Role.lc4 || c.role[i] == Role.lplc2 { result.append(i) }
+        case "sens":   if c.role[i] == Role.sens { result.append(i) }
+        case "ascend": if c.role[i] == Role.ascend { result.append(i) }
+        default: return nil
+        }
+    }
+    return result
+}
+
+/// Ablated copy of the connectome: the target neurons' outgoing edge weights are
+/// zeroed. Everything else (topology, other weights, fixed-point overflow bound
+/// via preserved multiset) is untouched. Always derived from the PRISTINE
+/// connectome so ablations never compound.
+private func ablateConnectome(_ c: Connectome, targets: Set<Int>) -> Connectome {
+    let e = c.e
+    var w = c.weightData.withUnsafeBytes { buf -> [Int16] in
+        [Int16](UnsafeBufferPointer(start: buf.baseAddress!.assumingMemoryBound(to: Int16.self),
+                                    count: e))
+    }
+    var zeroed = 0
+    for i in targets {
+        for k in Int(c.rowStart[i])..<Int(c.rowStart[i + 1]) {
+            w[k] = 0
+            zeroed += 1
+        }
+    }
+    let data = w.withUnsafeBufferPointer { Data(buffer: $0) }
+    fputs("lab-server: ablation zeroed \(zeroed) outgoing edges of \(targets.count) neurons\n", stderr)
+    return Connectome(n: c.n, e: c.e, positions: c.positions, superClass: c.superClass,
+                      side: c.side, nt: c.nt, role: c.role, rootId: c.rootId,
+                      rowStart: c.rowStart, colIdxData: c.colIdxData, weightData: data,
+                      superClassNames: c.superClassNames, ntNames: c.ntNames,
+                      isModulatory: c.isModulatory, roleIndices: c.roleIndices,
+                      roleName: c.roleName, typeName: c.typeName, loadMs: c.loadMs)
+}
 
 private func makeSim(seed: UInt32) -> Bool {
-    guard let c = connectome else { return false }
+    guard let c = activeConnectome else { return false }
     guard let s = MetalSim(connectome: c, spikeBus: nil, seed: seed) else { return false }
     s.perfLogIntervalMs = 0
+    // Re-apply intrinsic-drive zeroing after every sim (re)creation: reset()
+    // redraws baselines from the seed, which would otherwise resurrect the
+    // ablated neurons' resting drive.
+    if !ablatedTargets.isEmpty {
+        var b = s.baselineValues()
+        for i in ablatedTargets { b[i] = 0 }
+        s.setBaseline(b)
+    }
     sim = s
     simSeed = seed
     return true
@@ -219,6 +282,7 @@ private func handle(_ line: String) {
         }
         ok(id, ["version": LAB_VERSION, "n": s.n, "e": c.e, "device": s.deviceName,
                 "seed": simSeed, "shuffled": shuffled, "shuffle_seed": shuffleSeed,
+                "ablation": ablationDesc ?? "none",
                 "fixed_point_q": Int(log2(Double(s.fixedPointScale))),
                 "groups": groupSizes(s)])
 
@@ -265,6 +329,58 @@ private func handle(_ line: String) {
         s.stimulate(indices, strength: strength, durationMs: duration)
         ok(id, ["targeted": indices.count, "strength": strength, "duration_ms": duration,
                 "sim_ms": s.simMs])
+
+    case "ablate":
+        guard let c = connectome else { fail(id, "no_connectome", "not initialized"); return }
+        var targets = Set<Int>()
+        var desc = ""
+        if let g = d["group"] as? String {
+            guard let idxs = groupIndices(in: c, named: g), !idxs.isEmpty else {
+                fail(id, "bad_group", "unknown or empty group '\(g)'"); return
+            }
+            targets.formUnion(idxs)
+            desc = "ablate:\(g)(\(idxs.count))"
+        } else if let rnd = d["random"] as? NSNumber {
+            // Sham control: random size-matched slice of the unannotated ('other')
+            // population, seeded so the same sham is reproducible.
+            let count = max(1, min(c.n, rnd.intValue))
+            let shamSeed = (d["seed"] as? NSNumber)?.uint32Value ?? 1
+            let others = (0..<c.n).filter { c.role[$0] == Role.other }
+            guard count <= others.count else {
+                fail(id, "bad_count", "sham size \(count) exceeds \(others.count) 'other' neurons"); return
+            }
+            let rng = makeShuffleRng(shamSeed)
+            var pool = others
+            for _ in 0..<count {
+                let j = Int(rng() % UInt32(pool.count))
+                targets.insert(pool[j])
+                pool.swapAt(j, pool.count - 1)
+                pool.removeLast()
+            }
+            desc = "sham:random-other(\(count),seed\(shamSeed))"
+        } else if let ns = d["neurons"] as? [NSNumber] {
+            let ids = ns.map { $0.intValue }
+            guard !ids.isEmpty, ids.allSatisfy({ $0 >= 0 && $0 < c.n }) else {
+                fail(id, "bad_neuron_id", "ids must be nonempty and 0..<\(c.n)"); return
+            }
+            targets.formUnion(ids)
+            desc = "ablate:neurons(\(targets.count))"
+        } else {
+            fail(id, "bad_target", "provide 'group', 'random'(+seed), or 'neurons'"); return
+        }
+        // Always derived from the PRISTINE connectome: ablations never compound.
+        activeConnectome = ablateConnectome(c, targets: targets)
+        ablationDesc = desc
+        ablatedTargets = targets
+        guard makeSim(seed: simSeed) else { fail(id, "sim_init", "ablated sim init failed"); return }
+        ok(id, ["ablation": desc, "targeted": targets.count, "seed": simSeed])
+
+    case "ablate_clear":
+        activeConnectome = connectome
+        ablationDesc = nil
+        ablatedTargets = []
+        guard makeSim(seed: simSeed) else { fail(id, "sim_init", "restore failed"); return }
+        ok(id, ["ablation": "none", "seed": simSeed])
 
     case "step":
         guard let s = sim else { fail(id, "no_sim", "call reset first"); return }
@@ -340,6 +456,7 @@ func runLabServer() {
     } else {
         connectome = c
     }
+    activeConnectome = connectome
     guard makeSim(seed: SIM_SEED) else {
         fputs("lab-server: MetalSim init failed\n", stderr); exit(1)
     }
