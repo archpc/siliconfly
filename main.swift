@@ -993,6 +993,10 @@ if let i = args.firstIndex(of: "--brainshot") {
     runBrainshot(path: args.count > i + 1 ? args[i + 1] : "brain.png")
     exit(0)
 }
+if args.contains("--serve") {
+    runLabServer()
+    exit(0)
+}
 if args.contains("--gpucheck") {
     runGPUCheck()
 }
