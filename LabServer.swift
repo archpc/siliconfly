@@ -296,10 +296,16 @@ private func runStimTrial(_ d: [String: Any], _ id: Any?) {
     let post = max(0, min(MAX_TRIAL_MS, Int((d["post_ms"] as? NSNumber)?.intValue ?? 200)))
     let strength = clampF(num(d, "strength") ?? 0, 0, 2)
     let poisson = d["poisson"] as? Bool == true
-    let rateHz = clampF(num(d, "rate_hz") ?? 0, 0, 500)
+    let rateHz: Float
     if poisson {
-        guard rateHz >= 0 else { fail(id, "bad_rate", "rate_hz must be 0...500"); return }
+        // Explicit trial parameters are VALIDATED, not clamped: an
+        // out-of-range rate is a protocol error, not a tuning request.
+        guard let raw = num(d, "rate_hz"), raw >= 0, raw <= 500 else {
+            fail(id, "bad_rate", "rate_hz must be 0...500"); return
+        }
+        rateHz = raw
     } else {
+        rateHz = 0
         guard let ns = d["neurons"] as? [NSNumber], !ns.isEmpty, ns.count <= 512 else {
             fail(id, "bad_target", "neurons required (1..512) unless poisson"); return
         }
