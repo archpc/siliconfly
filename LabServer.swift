@@ -117,6 +117,19 @@ private var connectome: Connectome? = nil       // pristine (with shuffle if --s
 private var activeConnectome: Connectome? = nil // pristine or ablated; reset uses this
 private var ablationDesc: String? = nil
 private var ablatedTargets: Set<Int> = []
+private var tasteIndices: [Int] = []
+
+// The 21 sugar-sensitive GRNs of the Shiu-lineage feeding-initiation experiment
+// (eonsystemspbc/fly-brain code/benchmark.py experiment 'sugar'; Shiu et al.
+// 2024 Nature lineage). Mapped to specimen indices via rootId at load time.
+private let SUGAR_ROOTS: [UInt64] = [
+    720575940624963786, 720575940630233916, 720575940637568838, 720575940638202345,
+    720575940617000768, 720575940630797113, 720575940632889389, 720575940621754367,
+    720575940621502051, 720575940640649691, 720575940639332736, 720575940616885538,
+    720575940639198653, 720575940639259967, 720575940617937543, 720575940632425919,
+    720575940633143833, 720575940612670570, 720575940628853239, 720575940629176663,
+    720575940611875570,
+]
 
 // Group membership derived from the connectome arrays (NOT from the live sim's
 // groups, which may already be ablated). loomL/R use the `side` table.
@@ -172,7 +185,8 @@ private func ablateConnectome(_ c: Connectome, targets: Set<Int>) -> Connectome 
 
 private func makeSim(seed: UInt32) -> Bool {
     guard let c = activeConnectome else { return false }
-    guard let s = MetalSim(connectome: c, spikeBus: nil, seed: seed) else { return false }
+    let ti = tasteIndices.isEmpty ? nil : tasteIndices
+    guard let s = MetalSim(connectome: c, spikeBus: nil, seed: seed, tasteIndices: ti) else { return false }
     s.perfLogIntervalMs = 0
     // Re-apply intrinsic-drive zeroing after every sim (re)creation: reset()
     // redraws baselines from the seed, which would otherwise resurrect the
@@ -281,12 +295,25 @@ private func runStimTrial(_ d: [String: Any], _ id: Any?) {
     }
     let post = max(0, min(MAX_TRIAL_MS, Int((d["post_ms"] as? NSNumber)?.intValue ?? 200)))
     let strength = clampF(num(d, "strength") ?? 0, 0, 2)
-    guard let ns = d["neurons"] as? [NSNumber], !ns.isEmpty, ns.count <= 512 else {
-        fail(id, "bad_target", "neurons required (1..512)"); return
+    let poisson = d["poisson"] as? Bool == true
+    let rateHz = clampF(num(d, "rate_hz") ?? 0, 0, 500)
+    if poisson {
+        guard rateHz >= 0 else { fail(id, "bad_rate", "rate_hz must be 0...500"); return }
+    } else {
+        guard let ns = d["neurons"] as? [NSNumber], !ns.isEmpty, ns.count <= 512 else {
+            fail(id, "bad_target", "neurons required (1..512) unless poisson"); return
+        }
     }
-    let targets = ns.map { $0.intValue }
-    guard targets.allSatisfy({ $0 >= 0 && $0 < s.n }) else {
-        fail(id, "bad_neuron_id", "ids must be 0..<\(s.n)"); return
+    let targets: [Int]
+    if poisson {
+        targets = tasteIndices
+        guard !targets.isEmpty else { fail(id, "no_taste_port", "taste port not wired"); return }
+    } else {
+        let ns = (d["neurons"] as? [NSNumber])!.map { $0.intValue }
+        guard ns.allSatisfy({ $0 >= 0 && $0 < s.n }) else {
+            fail(id, "bad_neuron_id", "ids must be 0..<\(s.n)"); return
+        }
+        targets = ns
     }
     var watch = (d["watch"] as? [NSNumber])?.map { $0.intValue } ?? []
     guard watch.count <= 256, watch.allSatisfy({ $0 >= 0 && $0 < s.n }) else {
@@ -307,7 +334,11 @@ private func runStimTrial(_ d: [String: Any], _ id: Any?) {
     var watchTotals = [Int](repeating: 0, count: watch.count)
     var spikesBefore = s.totalSpikes
     var gfTotal = 0
-    s.stimulate(targets, strength: strength, durationMs: duration)
+    if poisson {
+        s.sugarRate = rateHz
+    } else {
+        s.stimulate(targets, strength: strength, durationMs: duration)
+    }
     for ms in 0..<(duration + post) {
         s.step(1)
         let hist = s.lastStepGroupCounts()
@@ -327,9 +358,11 @@ private func runStimTrial(_ d: [String: Any], _ id: Any?) {
         }
         watchPerStep.append(wThis)
     }
+    if poisson { s.sugarRate = 0 }
     let postRates = ratesDict(s)
     ok(id, ["seed": simSeed, "shuffled": shuffled, "shuffle_seed": shuffleSeed,
             "settle_ms": settle, "duration_ms": duration, "post_ms": post,
+            "poisson": poisson, "rate_hz": rateHz,
             "strength": strength, "targeted": targets.count,
             "pre_sim_ms": preSimMs, "sim_ms": s.simMs,
             "pre_rates": preRates, "post_rates": postRates,
@@ -371,6 +404,7 @@ private func handle(_ line: String) {
         if let v = num(d, "loomL") { s.loomL = clampF(v, 0, 1); applied["loomL"] = s.loomL }
         if let v = num(d, "loomR") { s.loomR = clampF(v, 0, 1); applied["loomR"] = s.loomR }
         if let v = num(d, "airPuff") { s.airPuff = clampF(v, 0, 1); applied["airPuff"] = s.airPuff }
+        if let v = num(d, "sugarRate") { s.sugarRate = clampF(v, 0, 500); applied["sugarRate"] = s.sugarRate }
         if let v = num(d, "gaitDrive") { s.gaitDrive = clampF(v, 0, 1); applied["gaitDrive"] = s.gaitDrive }
         if let v = num(d, "gaitPhase") { s.gaitPhase = clampF(v, 0, 1); applied["gaitPhase"] = s.gaitPhase }
         if let v = num(d, "activityScale") { s.activityScale = clampF(v, 0, 1.5); applied["activityScale"] = s.activityScale }
@@ -534,6 +568,13 @@ func runLabServer() {
         connectome = c
     }
     activeConnectome = connectome
+    // Map the sugar-GRN root IDs to specimen indices for the Poisson taste port.
+    if let cc = connectome {
+        var rid2idx = [UInt64: Int](minimumCapacity: cc.n)
+        for i in 0..<cc.n { rid2idx[cc.rootId[i]] = i }
+        tasteIndices = SUGAR_ROOTS.compactMap { rid2idx[$0] }
+        fputs("lab-server: taste port wired to \(tasteIndices.count)/\(SUGAR_ROOTS.count) sugar GRNs\n", stderr)
+    }
     guard makeSim(seed: SIM_SEED) else {
         fputs("lab-server: MetalSim init failed\n", stderr); exit(1)
     }

@@ -41,6 +41,9 @@ struct StepParams {
     float gaitPh;        // gaitPhase * 2pi
     float airPuffDrive;  // airPuff * 0.12 * sensoryGate (0 when gated off)
     float floorV;        // hyperpolarization clamp (SimParams.floorV, -2)
+    float tasteP;        // per-step probability of a Poisson taste spike (0 = off)
+    float tasteKick;     // charge deposited per Poisson taste spike
+    uint  tasteSeed;     // independent PCG stream for the taste draw
 };
 
 // PCG-style 32-bit hash (Jarzynski & Olano 2020). Mirrored bit-for-bit in
@@ -100,6 +103,11 @@ kernel void lif_update(
         vi += P.ascendDrive * (0.5f + 0.5f * precise::sin(P.gaitPh + phase[gid]));
     } else if (kind == 4u) {
         vi += P.airPuffDrive;
+    } else if (kind == 5u && P.tasteP > 0.0f) {
+        // Poisson taste spike: independent stream, so the noise draw above is
+        // untouched and existing (taste-off) modes stay bit-identical.
+        uint h2 = pcg(pcg(P.tasteSeed + P.stepIndex * 2654435761u) + gid);
+        if (float(h2 >> 8u) * 5.9604645e-8f < P.tasteP) { vi += P.tasteKick; }
     }
     vi += extInput[gid];
 

@@ -128,6 +128,9 @@ private struct StepParams {
     var loomDriveL: Float = 0, loomDriveR: Float = 0
     var ascendDrive: Float = 0, gaitPh: Float = 0, airPuffDrive: Float = 0
     var floorV: Float = 0
+    var tasteP: Float = 0       // per-step Poisson taste probability (0 = off)
+    var tasteKick: Float = 0
+    var tasteSeed: UInt32 = 0
 }
 
 // MARK: - Shared GPU resources
@@ -297,6 +300,7 @@ final class MetalSim {
     var gaitDrive: Float = 0      // body walking intensity -> ascending neurons
     var gaitPhase: Float = 0      // body gait phase 0..1 -> rhythmic proprioception
     var airPuff: Float = 0        // fast cursor motion near the fly -> sensory neurons
+    var sugarRate: Float = 0      // Poisson taste rate in Hz at the sugar GRNs (0 = off)
     var activityScale: Float = 1  // circadian / sleep neuromodulation of baseline+noise
     var sensoryGate: Float = 1    // sleep gates sensory input
 
@@ -366,8 +370,8 @@ final class MetalSim {
     private let stimLock = NSLock()
 
     init?(connectome c: Connectome, spikeBus: SpikeBus?, seed: UInt32 = 0x5EED_1F1F,
-          params: SimParams = SimParams()) {
-        assert(MemoryLayout<StepParams>.stride == 76, "StepParams must match LIF.metal")
+          params: SimParams = SimParams(), tasteIndices: [Int]? = nil) {
+        assert(MemoryLayout<StepParams>.stride == 88, "StepParams must match LIF.metal")
         self.spikeBus = spikeBus
         self.p = params
         self.seed = seed
@@ -418,6 +422,12 @@ final class MetalSim {
             case Role.sens:   inputKind[i] = 4; sens.append(i)
             default: break
             }
+        }
+        // Poisson taste targets (Operation Banana Peel / Second Helping): the
+        // identified sugar-GRN indices get inputKind 5. Zero when not provided,
+        // which leaves every existing mode untouched.
+        if let ti = tasteIndices {
+            for i in ti where i >= 0 && i < n { inputKind[i] = 5 }
         }
 
         func buf<T>(_ v: [T]) -> MTLBuffer? {
@@ -589,7 +599,10 @@ final class MetalSim {
                 ascendDrive: gaitDrive > 0.001 ? gaitDrive * p.ascendGain : 0,
                 gaitPh: gaitPhase * 2 * Float.pi,
                 airPuffDrive: airPuff > 0.001 ? airPuff * p.airPuffGain * sensoryGate : 0,
-                floorV: p.floorV))
+                floorV: p.floorV,
+                tasteP: sugarRate > 0.001 ? sugarRate * 0.001 : 0,
+                tasteKick: p.noiseKick,
+                tasteSeed: seed &+ 0x7A57_1E7E))
         }
 
         memset(spikeCountBuf.contents(), 0, k * 4)
