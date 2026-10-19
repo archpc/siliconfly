@@ -308,7 +308,7 @@ private func runStimTrial(_ d: [String: Any], _ id: Any?) {
     var spikesBefore = s.totalSpikes
     var gfTotal = 0
     s.stimulate(targets, strength: strength, durationMs: duration)
-    for _ in 0..<(duration + post) {
+    for ms in 0..<(duration + post) {
         s.step(1)
         let hist = s.lastStepGroupCounts()
         let totalNow = s.totalSpikes
